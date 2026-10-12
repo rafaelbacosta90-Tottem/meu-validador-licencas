@@ -1,4 +1,3 @@
-// api/valida.js
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
@@ -7,45 +6,62 @@ const supabase = createClient(
 );
 
 export default async function handler(req, res) {
+  // Permite CORS (opcional, bom para evitar bloqueios)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ status: 'error', message: 'Método não permitido' });
   }
 
-  const { chave, hwid } = req.body;
+  // Agora recebe "cnpj" em vez de "chave"
+  const { cnpj, hwid } = req.body;
 
-  if (!chave || !hwid) {
-    return res.status(400).json({ status: 'error', message: 'Chave e HWID são obrigatórios' });
+  if (!cnpj || !hwid) {
+    return res.status(400).json({ status: 'error', message: 'CNPJ e HWID são obrigatórios.' });
   }
 
-  // 1. Busca a chave no banco
+  // 1. Busca o CNPJ no banco
   const { data: licenca, error } = await supabase
     .from('licencas')
     .select('*')
-    .eq('chave', chave)
+    .eq('cnpj', cnpj)
     .single();
 
   if (error || !licenca) {
-    return res.status(404).json({ status: 'invalid', message: 'Chave não encontrada' });
+    return res.status(404).json({ status: 'invalid', message: 'CNPJ não encontrado ou não cadastrado.' });
   }
 
-  // 2. Verifica se está ativa
+  // 2. Verifica se a licença está ativa manualmente
   if (!licenca.ativa) {
-    return res.status(403).json({ status: 'invalid', message: 'Licença desativada' });
+    return res.status(403).json({ status: 'invalid', message: 'Licença desativada pelo administrador.' });
   }
 
-  // 3. Verifica expiração
+  // 3. Verifica a Validade (Data Atual vs Data de Expiração)
   const hoje = new Date();
+  hoje.setHours(0, 0, 0, 0); // Zera as horas para comparar apenas o dia
+  
   const expiracao = new Date(licenca.data_expiracao);
+  // Adiciona o fuso horário para evitar problemas de viragem de dia
+  expiracao.setHours(23, 59, 59, 999);
+
   if (hoje > expiracao) {
-    return res.status(403).json({ status: 'expired', message: 'Licença expirada' });
+    return res.status(403).json({ 
+        status: 'expired', 
+        message: 'A sua licença expirou no dia ' + expiracao.toLocaleDateString('pt-BR') + '. Contacte o suporte.'
+    });
   }
 
-  // 4. Bloqueia múltiplos PCs (Vincula a chave ao HWID do primeiro PC que usou)
+  // 4. Bloqueia múltiplos PCs (HWID)
   if (!licenca.hwid) {
-    // Registra o HWID no primeiro uso
+    // Registra a máquina no primeiro uso
     await supabase.from('licencas').update({ hwid: hwid }).eq('id', licenca.id);
   } else if (licenca.hwid !== hwid) {
-    return res.status(403).json({ status: 'unauthorized', message: 'Chave em uso em outra máquina' });
+    return res.status(403).json({ status: 'unauthorized', message: 'Este CNPJ já está vinculado a outro computador.' });
   }
 
   return res.status(200).json({ status: 'success', message: 'Licença válida!' });

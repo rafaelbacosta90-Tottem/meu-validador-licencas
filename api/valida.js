@@ -64,5 +64,12 @@ export default async function handler(req, res) {
     return res.status(403).json({ status: 'unauthorized', message: 'Este CNPJ já está vinculado a outro computador.' });
   }
 
-  return res.status(200).json({ status: 'success', message: 'Licença válida!' });
+  //return res.status(200).json({ status: 'success', message: 'Licença válida!' });
+  // Substitua a última linha do valida.js por isto:
+return res.status(200).json({ 
+    status: 'success', 
+    message: 'Licença válida!',
+    data_validade: licenca.data_expiracao // Adicionamos a data aqui!
+});
+
 }

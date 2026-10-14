@@ -1,63 +1,89 @@
 import { createClient } from '@supabase/supabase-js';
 
-// As chaves devem estar configuradas nas Variáveis de Ambiente da Vercel
+// Inicializa a conexão com o Supabase usando as variáveis de ambiente da Vercel
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 export default async function handler(req, res) {
-  // Aceita apenas requisições POST
-  if (req.method !== 'POST') {
-    return res.status(405).json({ status: 'error', message: 'Método não permitido.' });
-  }
+    // Configuração de segurança CORS (Permite que o programa Python faça o request)
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'OPTIONS,POST');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Captura os dados enviados pelo Buscador.py
-  const { cnpj, hwid, maquina, data_acesso } = req.body;
-
-  if (!cnpj || !hwid) {
-    return res.status(400).json({ status: 'error', message: 'CNPJ e HWID são obrigatórios.' });
-  }
-
-  try {
-    // 1. Busca a licença no Supabase
-    const { data: licenca, error } = await supabase
-      .from('licencas')
-      .select('*')
-      .eq('cnpj', cnpj)
-      .eq('hwid', hwid)
-      .single();
-
-    if (error || !licenca) {
-      return res.status(404).json({ status: 'error', message: 'Licença não encontrada para esta máquina.' });
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
     }
 
-    // 2. Verifica se a licença está ativa
-    if (!licenca.ativa) {
-      return res.status(403).json({ status: 'error', message: 'Licença inativa ou bloqueada.' });
+    if (req.method !== 'POST') {
+        return res.status(405).json({ status: 'error', message: 'Apenas método POST é permitido.' });
     }
 
-    // 3. Grava o nome da máquina e a data do último acesso no Supabase
-    const { error: updateError } = await supabase
-      .from('licencas')
-      .update({ 
-        nome_maquina: maquina || 'Desconhecida',
-        ultima_validacao: data_acesso || new Date().toISOString()
-      })
-      .eq('id', licenca.id);
+    // Recebe os dados enviados pelo Buscador.py
+    const { cnpj, hwid, maquina, data_acesso, versao_atual } = req.body;
 
-    if (updateError) {
-      console.error("Erro ao gravar log da máquina:", updateError);
-      // O sistema continua mesmo se o log falhar, para não bloquear o cliente injustamente
+    if (!cnpj) {
+        return res.status(400).json({ status: 'error', message: 'CNPJ não fornecido.' });
     }
 
-    // 4. Retorna sucesso e a data de validade para o Python
-    return res.status(200).json({
-      status: 'success',
-      data_validade: licenca.data_expiracao
-    });
+    try {
+        // =======================================================================
+        // PASSO 1: VERIFICAR A LICENÇA DO CLIENTE
+        // ATENÇÃO: Substitua 'licencas' pelo nome da sua tabela principal de clientes
+        // =======================================================================
+        const { data: licenca, error: erroLicenca } = await supabase
+            .from('licencas') 
+            .select('*')
+            .eq('cnpj', cnpj)
+            .single();
 
-  } catch (err) {
-    console.error("Erro na API:", err);
-    return res.status(500).json({ status: 'error', message: 'Erro interno no servidor de validação.' });
-  }
+        if (erroLicenca || !licenca) {
+            return res.status(403).json({ status: 'error', message: 'CNPJ não encontrado ou não autorizado.' });
+        }
+
+        // Pega a data de validade que está no banco de dados (ajuste o nome da coluna se necessário)
+        const dataValidade = licenca.data_validade || licenca.data_expiracao; 
+
+        // Verificação extra de segurança no servidor
+        const hoje = new Date().toISOString().split('T')[0];
+        if (hoje > dataValidade) {
+            return res.status(403).json({ status: 'error', message: 'A sua licença expirou.' });
+        }
+
+
+        // =======================================================================
+        // PASSO 2: GRAVAR O LOG NA NOVA TABELA 'acessos_clientes' (UPSERT)
+        // =======================================================================
+        const { error: erroLog } = await supabase
+            .from('acessos_clientes')
+            .upsert(
+                { 
+                    cnpj: cnpj,
+                    maquina: maquina || 'Desconhecida',
+                    versao_atual: versao_atual || 'Antiga',
+                    data_ultimo_acesso: new Date().toISOString()
+                },
+                { onConflict: 'cnpj,maquina' } // Atualiza a linha se a máquina e CNPJ já existirem
+            );
+
+        if (erroLog) {
+            console.error("Erro ao gravar log no Supabase:", erroLog);
+            // Ignoramos o erro para não impedir o cliente de entrar só por falha no log
+        }
+
+
+        // =======================================================================
+        // PASSO 3: RETORNAR SUCESSO E A DATA PARA O PYTHON
+        // =======================================================================
+        return res.status(200).json({
+            status: 'success',
+            message: 'Licença válida!',
+            data_validade: dataValidade // Retorna a data para o Python criar a Assinatura HMAC local
+        });
+
+    } catch (error) {
+        console.error("Erro interno da API:", error);
+        return res.status(500).json({ status: 'error', message: 'Erro interno no servidor de validação.' });
+    }
 }

@@ -1,89 +1,66 @@
 import { createClient } from '@supabase/supabase-js';
 
-// Inicializa a conexão com o Supabase usando as variáveis de ambiente da Vercel
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 export default async function handler(req, res) {
-    // Configuração de segurança CORS (Permite que o programa Python faça o request)
     res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'OPTIONS,POST');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
+    if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method !== 'POST') return res.status(405).json({ status: 'error', message: 'Apenas POST.' });
 
-    if (req.method !== 'POST') {
-        return res.status(405).json({ status: 'error', message: 'Apenas método POST é permitido.' });
-    }
+    const { cnpj, hwid, maquina, versao_atual, ferramenta } = req.body;
+    const nomeFerramenta = ferramenta || 'Buscador PNCP'; // Nome do módulo que o app está a solicitar
 
-    // Recebe os dados enviados pelo Buscador.py
-    const { cnpj, hwid, maquina, data_acesso, versao_atual } = req.body;
-
-    if (!cnpj) {
-        return res.status(400).json({ status: 'error', message: 'CNPJ não fornecido.' });
-    }
+    if (!cnpj || !hwid) return res.status(400).json({ status: 'error', message: 'CNPJ ou HWID não fornecido.' });
 
     try {
-        // =======================================================================
-        // PASSO 1: VERIFICAR A LICENÇA DO CLIENTE
-        // ATENÇÃO: Substitua 'licencas' pelo nome da sua tabela principal de clientes
-        // =======================================================================
-        const { data: licenca, error: erroLicenca } = await supabase
-            .from('licencas') 
-            .select('*')
+        // 1. Encontra a Licença da Máquina (Baseado no CNPJ e HWID)
+        const { data: licenca, error: erroLic } = await supabase
+            .from('licencas')
+            .select('id')
             .eq('cnpj', cnpj)
+            .eq('hwid', hwid)
             .single();
 
-        if (erroLicenca || !licenca) {
-            return res.status(403).json({ status: 'error', message: 'CNPJ não encontrado ou não autorizado.' });
-        }
+        if (erroLic || !licenca) return res.status(403).json({ status: 'error', message: 'Máquina não autorizada ou CNPJ não encontrado.' });
 
-        // Pega a data de validade que está no banco de dados (ajuste o nome da coluna se necessário)
-        const dataValidade = licenca.data_validade || licenca.data_expiracao; 
+        // 2. Encontra o ID da Ferramenta solicitada
+        const { data: fer, error: erroFer } = await supabase
+            .from('ferramentas')
+            .select('id')
+            .eq('nome', nomeFerramenta)
+            .single();
 
-        // Verificação extra de segurança no servidor
+        if (erroFer || !fer) return res.status(404).json({ status: 'error', message: `O módulo '${nomeFerramenta}' não existe no servidor.` });
+
+        // 3. Cruza os dados para ver se esta máquina tem este módulo ativo
+        const { data: permissao, error: erroPerm } = await supabase
+            .from('licencas_ferramentas')
+            .select('data_expiracao, ativa')
+            .eq('licenca_id', licenca.id)
+            .eq('ferramenta_id', fer.id)
+            .single();
+
+        if (erroPerm || !permissao) return res.status(403).json({ status: 'error', message: `Você não possui o módulo '${nomeFerramenta}' liberado para este computador.` });
+        if (!permissao.ativa) return res.status(403).json({ status: 'error', message: `O módulo '${nomeFerramenta}' foi bloqueado pelo administrador.` });
+
         const hoje = new Date().toISOString().split('T')[0];
-        if (hoje > dataValidade) {
-            return res.status(403).json({ status: 'error', message: 'A sua licença expirou.' });
-        }
+        if (hoje > permissao.data_expiracao) return res.status(403).json({ status: 'error', message: `A licença do módulo '${nomeFerramenta}' expirou.` });
 
+        // 4. Salva o Log de Acesso
+        await supabase.from('acessos_clientes').upsert({
+            cnpj: cnpj, maquina: maquina || 'Desconhecida', versao_atual: versao_atual, data_ultimo_acesso: new Date().toISOString()
+        }, { onConflict: 'cnpj,maquina' });
 
-        // =======================================================================
-        // PASSO 2: GRAVAR O LOG NA NOVA TABELA 'acessos_clientes' (UPSERT)
-        // =======================================================================
-        const { error: erroLog } = await supabase
-            .from('acessos_clientes')
-            .upsert(
-                { 
-                    cnpj: cnpj,
-                    maquina: maquina || 'Desconhecida',
-                    versao_atual: versao_atual || 'Antiga',
-                    data_ultimo_acesso: new Date().toISOString()
-                },
-                { onConflict: 'cnpj,maquina' } // Atualiza a linha se a máquina e CNPJ já existirem
-            );
-
-        if (erroLog) {
-            console.error("Erro ao gravar log no Supabase:", erroLog);
-            // Ignoramos o erro para não impedir o cliente de entrar só por falha no log
-        }
-
-
-        // =======================================================================
-        // PASSO 3: RETORNAR SUCESSO E A DATA PARA O PYTHON
-        // =======================================================================
-        return res.status(200).json({
-            status: 'success',
-            message: 'Licença válida!',
-            data_validade: dataValidade // Retorna a data para o Python criar a Assinatura HMAC local
-        });
+        return res.status(200).json({ status: 'success', message: 'Licença válida!', data_validade: permissao.data_expiracao });
 
     } catch (error) {
-        console.error("Erro interno da API:", error);
+        console.error(error);
         return res.status(500).json({ status: 'error', message: 'Erro interno no servidor de validação.' });
     }
 }

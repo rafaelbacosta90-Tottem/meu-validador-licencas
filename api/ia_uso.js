@@ -9,59 +9,42 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
     if (req.method === 'OPTIONS') return res.status(200).end();
-    if (req.method !== 'POST') return res.status(405).json({ status: 'error', message: 'Apenas POST' });
-
-    const { cnpj, maquina, incrementar } = req.body;
-    if (!cnpj) return res.status(400).json({ status: 'error', message: 'CNPJ obrigatório.' });
+    
+    const { cnpj, hwid, maquina, incrementar } = req.body;
+    if (!cnpj || !hwid) return res.status(400).json({ status: 'error', message: 'CNPJ ou HWID não fornecido.' });
 
     try {
-        // 1. Pega o Limite Diário do CNPJ
-        const { data: licenca } = await supabase.from('licencas').select('limite_ia_diario').eq('cnpj', cnpj).single();
+        // 1. Pega o Limite Diário DAQUELA MÁQUINA
+        const { data: licenca } = await supabase.from('licencas').select('limite_ia_diario').eq('cnpj', cnpj).eq('hwid', hwid).single();
         const limiteDiario = licenca?.limite_ia_diario || 10;
 
-        // 2. Conta quantos usos esse CNPJ já teve HOJE
+        // 2. Conta os usos da máquina hoje
         const hoje = new Date().toISOString().split('T')[0];
-        const { data: acessos } = await supabase.from('acessos_clientes').select('maquina, usos_ia_hoje, data_uso_ia').eq('cnpj', cnpj);
+        const { data: acesso } = await supabase.from('acessos_clientes').select('usos_ia_hoje, data_uso_ia').eq('cnpj', cnpj).eq('maquina', maquina).single();
 
-        let totalUsosCNPJ = 0;
         let usoDestaMaquina = 0;
-
-        if (acessos) {
-            for (let a of acessos) {
-                if (a.data_uso_ia === hoje) {
-                    totalUsosCNPJ += (a.usos_ia_hoje || 0);
-                    if (a.maquina === maquina) usoDestaMaquina = (a.usos_ia_hoje || 0);
-                }
-            }
+        if (acesso && acesso.data_uso_ia === hoje) {
+            usoDestaMaquina = acesso.usos_ia_hoje || 0;
         }
 
         // 3. Verifica Limite e Incrementa
         if (incrementar) {
-            if (totalUsosCNPJ >= limiteDiario) {
-                return res.status(403).json({ status: 'error', message: `O limite diário de ${limiteDiario} análises de IA para o seu plano foi atingido hoje.` });
+            if (usoDestaMaquina >= limiteDiario) {
+                return res.status(403).json({ status: 'error', message: `O limite diário de ${limiteDiario} análises desta máquina foi atingido.` });
             }
             
-            // Grava o novo uso na máquina específica
             await supabase.from('acessos_clientes').upsert({
-                cnpj: cnpj,
-                maquina: maquina || 'Desconhecida',
-                usos_ia_hoje: usoDestaMaquina + 1,
-                data_uso_ia: hoje,
-                data_ultimo_acesso: new Date().toISOString()
+                cnpj: cnpj, maquina: maquina || 'Desconhecida', usos_ia_hoje: usoDestaMaquina + 1, data_uso_ia: hoje, data_ultimo_acesso: new Date().toISOString()
             }, { onConflict: 'cnpj,maquina' });
             
-            totalUsosCNPJ += 1; // Atualiza a resposta
+            usoDestaMaquina += 1;
         }
 
-        // 4. Se autorizou, entrega as chaves de IA protegidas
+        // 4. Retorna as chaves seguras
         const { data: config } = await supabase.from('controle_versoes').select('chave_dots, chave_gemini').eq('id', 1).single();
 
         return res.status(200).json({
-            status: 'success',
-            chave_dots: config?.chave_dots || '',
-            chave_gemini: config?.chave_gemini || '',
-            usos_hoje: totalUsosCNPJ,
-            limite_diario: limiteDiario
+            status: 'success', chave_dots: config?.chave_dots || '', chave_gemini: config?.chave_gemini || '', usos_hoje: usoDestaMaquina, limite_diario: limiteDiario
         });
 
     } catch (error) {

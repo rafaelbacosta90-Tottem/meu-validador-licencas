@@ -16,7 +16,7 @@ export default async function handler(req, res) {
     try {
         // 1. Pega o Limite Diário DAQUELA MÁQUINA
         const { data: licenca } = await supabase.from('licencas').select('limite_ia_diario').eq('cnpj', cnpj).eq('hwid', hwid).single();
-        const limiteDiario = licenca?.limite_ia_diario || 10;
+        const limiteDiario = licenca?.limite_ia_diario;
 
         // 2. Conta os usos da máquina hoje
         const hoje = new Date().toISOString().split('T')[0];
